@@ -8,21 +8,12 @@ Keseimbangan ini mengindikasikan bahwa bisnis berhasil membangun kehadiran omnic
 Di mana pelanggan aktif berbelanja melalui berbagai platform tanpa ada ketergantungan ekstrem pada satu titik sentuh saja
 
 Airflow:
-Alur tugas bergerak secara berurutan mulai dari inisialisasi dan validasi (validate_manifest, init_schemas), 
-penyerapan data mentah (load_bronze), 
-pembersihan dan transformasi (build_silver), 
-hingga agregasi data siap pakai untuk analitik bisnis (build_gold)
+Tampilan grafis Apache Airflow ini menyajikan struktur alur kerja (DAG Graph View) dari pipeline omnichannel_retail_pipeline. Jika dibaca dari sudut pandang bisnis dan tata kelola data perusahaan, arsitektur alur ini memberikan beberapa insight penting:
 
-Ini menjelaskan asal-usul tabel gold.order_360 pada analisis SQL sebelumnya: 
-data tersebut dihasilkan langsung melalui tahapan build_gold dalam pipeline ini setelah melewati penyaringan bertahap
+1. Kesiapan Data Bisnis untuk Pengambilan Keputusan 
+Pipeline ini secara eksplisit mengalirkan data mentah menuju build_gold_layer melalui tahapan Bronze dan Silver:
+Di level bisnis ritel, Gold Layer adalah tempat berkumpulnya metrik-metrik finansial tingkat eksekutif—seperti perhitungan GMV, Net Revenue, AOV, dan Refund Rate per kanal penjualan. Seluruh rangkaian proses berhasil selesai dengan status hijau (success), menandakan bahwa data transaksi di layer analitik bisnis sudah terisi secara utuh, konsisten, dan siap dikonsumsi langsung oleh tim manajemen bisnis (C-level/decision makers). 
 
-Pipeline ini tidak sekadar memindahkan data, melainkan menyematkan kontrol kualitas aktif di setiap tahap penting:
-Terdapat tahapan eksplisit quality_gate (sebelum masuk ke Gold) dan validate_gold (setelah pembentukan data analitik)
-Kedua run yang tercatat menunjukkan status hijau (success) pada seluruh langkah validasi ini, 
-yang berarti data agregat ritel yang dihasilkan telah memenuhi kriteria integritas, schema check, maupun batasan kualitas tanpa adanya data korup.
-
-Task terakhir bernama record_failure berstatus merah muda (skipped) pada kedua proses eksekusi.
-Ini merupakan tanda positif dalam pola perancangan DAG: 
-task record_failure kemungkinan dikonfigurasi dengan TriggerRule.ONE_FAILED atau 
-serupa untuk mencatat insiden hanya jika ada task hulu yang gagal. 
-Status skipped memastikan bahwa pipeline berjalan mulus tanpa interupsi kesalahan sama sekali.
+2. Kehadiran Skema Operasional Khusus (Auditing & Traceability)
+Adanya task create_ops_schema yang berdampingan dengan skema data analitik menunjukkan kesadaran tinggi akan tata kelola kepatuhan (governance & auditability):
+Skema ops biasanya berfungsi mencatat metadata teknis seperti log eksekusi, jejak audit, waktu pemrosesan, dan jejak lineage data.   Bagi bisnis, ini memberikan kepastian bahwa setiap data rupiah/omzet yang dilaporkan ke pemangku kepentingan memiliki rekam jejak yang transparan dan dapat diaudit sewaktu-waktu jika terjadi selisih rekonsiliasi keuangan.
