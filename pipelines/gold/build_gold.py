@@ -34,15 +34,101 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DB_URL = os.getenv(
     "DATABASE_URL",
     os.getenv("LOCAL_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"),
 )
+
+# Expected columns per Gold contract table (matches database/schemas/gold.sql)
+GOLD_CONTRACT_COLUMNS: dict[str, set[str]] = {
+    "order_360": {
+        "order_id",
+        "customer_id",
+        "order_date",
+        "sales_channel",
+        "store_id",
+        "gross_merchandise_value",
+        "discount_amount",
+        "shipping_revenue",
+        "captured_payment_amount",
+        "refunded_amount",
+        "net_revenue",
+        "item_count",
+        "unit_quantity",
+        "order_status",
+        "payment_status",
+        "return_status",
+        "promotion_count",
+        "first_order_flag",
+        "pipeline_run_id",
+    },
+    "customer_daily": {
+        "customer_id",
+        "metric_date",
+        "order_count",
+        "unit_quantity",
+        "gross_revenue",
+        "net_revenue",
+        "refund_amount",
+        "return_count",
+        "support_contacts",
+        "active_channel",
+        "new_customer_flag",
+        "repeat_customer_flag",
+        "pipeline_run_id",
+    },
+    "product_daily": {
+        "product_id",
+        "metric_date",
+        "active_category",
+        "units_sold",
+        "order_count",
+        "gross_revenue",
+        "net_revenue",
+        "refunded_units",
+        "available_inventory",
+        "reserved_inventory",
+        "stockout_flag",
+        "promotion_count",
+        "pipeline_run_id",
+    },
+    "channel_campaign_daily": {
+        "metric_date",
+        "sales_channel",
+        "campaign_id",
+        "campaign_spend",
+        "attributed_orders",
+        "attributed_customers",
+        "gross_revenue",
+        "net_revenue",
+        "refunds",
+        "roas",
+        "conversion_rate",
+        "pipeline_run_id",
+    },
+    "executive_kpis_daily": {
+        "metric_date",
+        "total_orders",
+        "gross_revenue",
+        "net_revenue",
+        "average_order_value",
+        "refund_rate",
+        "return_rate",
+        "repeat_customer_rate",
+        "stockout_rate",
+        "active_customers",
+        "support_contact_rate",
+        "data_freshness_utc",
+        "pipeline_run_id",
+    },
+}
 
 
 def _new_run_id() -> str:
@@ -80,11 +166,32 @@ def _get_connection():
 
 
 def _ensure_gold_schema(cur) -> None:
-    """Ensure the ``gold`` schema and contract tables exist exactly as specified in ``gold.sql``."""
+    """Ensure the ``gold`` schema and contract tables exist exactly as specified in ``gold.sql``.
+
+    Also verifies that any pre-existing ``gold.*`` tables match ``GOLD_CONTRACT_COLUMNS``;
+    if an older or mismatched table definition exists, it is dropped and recreated cleanly.
+    """
+    ops_sql_path = PROJECT_ROOT / "database" / "schemas" / "ops.sql"
+    if ops_sql_path.exists():
+        cur.execute(ops_sql_path.read_text(encoding="utf-8"))
+
+    cur.execute("CREATE SCHEMA IF NOT EXISTS gold;")
+
+    for table_name, expected_cols in GOLD_CONTRACT_COLUMNS.items():
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'gold' AND table_name = %s
+            """,
+            (table_name,),
+        )
+        existing_cols = {row[0] for row in cur.fetchall()}
+        if existing_cols and existing_cols != expected_cols:
+            cur.execute(f"DROP TABLE IF EXISTS gold.{table_name} CASCADE;")
+
     cur.execute(
         """
-        CREATE SCHEMA IF NOT EXISTS gold;
-
         CREATE TABLE IF NOT EXISTS gold.order_360 (
             order_id TEXT PRIMARY KEY,
             customer_id TEXT NOT NULL,
@@ -318,7 +425,6 @@ def run_gold(pipeline_run_id: str | None = None) -> str:
                     WHEN COALESCE(rta.has_closed, FALSE) THEN 'closed'
                     WHEN COALESCE(rta.has_received, FALSE) THEN 'received'
                     WHEN COALESCE(rta.has_requested, FALSE) THEN 'requested'
-                    WHEN o.status::TEXT = 'returned' THEN 'returned'
                     ELSE 'none'
                 END AS return_status,
                 COALESCE(pa.promotion_count, 0)::INTEGER AS promotion_count,
@@ -464,8 +570,6 @@ def run_gold(pipeline_run_id: str | None = None) -> str:
                                     ifx.quantity * LEAST(1.0, ifx.order_refunded_amount / ifx.order_pre_refund_total)
                                 )::INTEGER
                             )
-                            WHEN ifx.return_status <> 'none'
-                            THEN ifx.quantity
                             ELSE 0
                         END
                     )::INTEGER AS refunded_units
@@ -983,6 +1087,153 @@ def validate_gold(pipeline_run_id: str | None = None) -> bool:
                    OR repeat_customer_rate < 0 OR repeat_customer_rate > 1
                    OR stockout_rate < 0 OR stockout_rate > 1
                    OR support_contact_rate < 0 OR support_contact_rate > 1
+                """,
+                "0",
+                lambda val: int(val) == 0,
+            ),
+            (
+                "gold_order_360_return_reconciliation",
+                "reconciliation",
+                "gold.order_360",
+                """
+                SELECT (
+                    ABS(
+                        (SELECT COUNT(*) FROM gold.order_360 WHERE return_status <> 'none') -
+                        (SELECT COUNT(DISTINCT order_id) FROM silver.return_events)
+                    ) +
+                    ABS(
+                        (SELECT COALESCE(SUM(return_count), 0) FROM gold.customer_daily) -
+                        (SELECT COUNT(*) FROM gold.order_360 WHERE return_status <> 'none')
+                    )
+                )
+                """,
+                "0",
+                lambda val: int(val) == 0,
+            ),
+            (
+                "gold_executive_kpis_refund_and_return_rate_formula",
+                "business_rule",
+                "gold.executive_kpis_daily",
+                """
+                WITH expected_rates AS (
+                    SELECT
+                        f.order_date AS metric_date,
+                        COALESCE(
+                            ROUND(
+                                COUNT(f.order_id) FILTER (WHERE f.refunded_amount > 0)::NUMERIC
+                                / NULLIF(COUNT(f.order_id) FILTER (WHERE f.captured_payment_amount > 0), 0),
+                                4
+                            ),
+                            0
+                        )::NUMERIC(14, 4) AS expected_refund_rate,
+                        COALESCE(
+                            ROUND(
+                                COUNT(f.order_id) FILTER (WHERE f.return_status <> 'none')::NUMERIC
+                                / NULLIF(COUNT(f.order_id), 0),
+                                4
+                            ),
+                            0
+                        )::NUMERIC(14, 4) AS expected_return_rate
+                    FROM gold.order_360 f
+                    GROUP BY f.order_date
+                )
+                SELECT COUNT(*)
+                FROM gold.executive_kpis_daily k
+                JOIN expected_rates e ON e.metric_date = k.metric_date
+                WHERE k.refund_rate <> e.expected_refund_rate
+                   OR k.return_rate <> e.expected_return_rate
+                """,
+                "0",
+                lambda val: int(val) == 0,
+            ),
+            (
+                "gold_contract_column_types_valid",
+                "business_rule",
+                "gold.order_360",
+                """
+                WITH expected_gold_cols(table_name, column_name, data_type) AS (
+                    VALUES
+                        ('order_360', 'order_id', 'text'),
+                        ('order_360', 'customer_id', 'text'),
+                        ('order_360', 'order_date', 'date'),
+                        ('order_360', 'sales_channel', 'text'),
+                        ('order_360', 'store_id', 'text'),
+                        ('order_360', 'gross_merchandise_value', 'numeric'),
+                        ('order_360', 'discount_amount', 'numeric'),
+                        ('order_360', 'shipping_revenue', 'numeric'),
+                        ('order_360', 'captured_payment_amount', 'numeric'),
+                        ('order_360', 'refunded_amount', 'numeric'),
+                        ('order_360', 'net_revenue', 'numeric'),
+                        ('order_360', 'item_count', 'integer'),
+                        ('order_360', 'unit_quantity', 'integer'),
+                        ('order_360', 'order_status', 'text'),
+                        ('order_360', 'payment_status', 'text'),
+                        ('order_360', 'return_status', 'text'),
+                        ('order_360', 'promotion_count', 'integer'),
+                        ('order_360', 'first_order_flag', 'boolean'),
+                        ('order_360', 'pipeline_run_id', 'text'),
+                        ('customer_daily', 'customer_id', 'text'),
+                        ('customer_daily', 'metric_date', 'date'),
+                        ('customer_daily', 'order_count', 'integer'),
+                        ('customer_daily', 'unit_quantity', 'integer'),
+                        ('customer_daily', 'gross_revenue', 'numeric'),
+                        ('customer_daily', 'net_revenue', 'numeric'),
+                        ('customer_daily', 'refund_amount', 'numeric'),
+                        ('customer_daily', 'return_count', 'integer'),
+                        ('customer_daily', 'support_contacts', 'integer'),
+                        ('customer_daily', 'active_channel', 'text'),
+                        ('customer_daily', 'new_customer_flag', 'boolean'),
+                        ('customer_daily', 'repeat_customer_flag', 'boolean'),
+                        ('customer_daily', 'pipeline_run_id', 'text'),
+                        ('product_daily', 'product_id', 'text'),
+                        ('product_daily', 'metric_date', 'date'),
+                        ('product_daily', 'active_category', 'text'),
+                        ('product_daily', 'units_sold', 'integer'),
+                        ('product_daily', 'order_count', 'integer'),
+                        ('product_daily', 'gross_revenue', 'numeric'),
+                        ('product_daily', 'net_revenue', 'numeric'),
+                        ('product_daily', 'refunded_units', 'integer'),
+                        ('product_daily', 'available_inventory', 'integer'),
+                        ('product_daily', 'reserved_inventory', 'integer'),
+                        ('product_daily', 'stockout_flag', 'boolean'),
+                        ('product_daily', 'promotion_count', 'integer'),
+                        ('product_daily', 'pipeline_run_id', 'text'),
+                        ('channel_campaign_daily', 'metric_date', 'date'),
+                        ('channel_campaign_daily', 'sales_channel', 'text'),
+                        ('channel_campaign_daily', 'campaign_id', 'text'),
+                        ('channel_campaign_daily', 'campaign_spend', 'numeric'),
+                        ('channel_campaign_daily', 'attributed_orders', 'integer'),
+                        ('channel_campaign_daily', 'attributed_customers', 'integer'),
+                        ('channel_campaign_daily', 'gross_revenue', 'numeric'),
+                        ('channel_campaign_daily', 'net_revenue', 'numeric'),
+                        ('channel_campaign_daily', 'refunds', 'numeric'),
+                        ('channel_campaign_daily', 'roas', 'numeric'),
+                        ('channel_campaign_daily', 'conversion_rate', 'numeric'),
+                        ('channel_campaign_daily', 'pipeline_run_id', 'text'),
+                        ('executive_kpis_daily', 'metric_date', 'date'),
+                        ('executive_kpis_daily', 'total_orders', 'integer'),
+                        ('executive_kpis_daily', 'gross_revenue', 'numeric'),
+                        ('executive_kpis_daily', 'net_revenue', 'numeric'),
+                        ('executive_kpis_daily', 'average_order_value', 'numeric'),
+                        ('executive_kpis_daily', 'refund_rate', 'numeric'),
+                        ('executive_kpis_daily', 'return_rate', 'numeric'),
+                        ('executive_kpis_daily', 'repeat_customer_rate', 'numeric'),
+                        ('executive_kpis_daily', 'stockout_rate', 'numeric'),
+                        ('executive_kpis_daily', 'active_customers', 'integer'),
+                        ('executive_kpis_daily', 'support_contact_rate', 'numeric'),
+                        ('executive_kpis_daily', 'data_freshness_utc', 'timestamp with time zone'),
+                        ('executive_kpis_daily', 'pipeline_run_id', 'text')
+                )
+                SELECT COUNT(*)
+                FROM expected_gold_cols e
+                FULL OUTER JOIN (
+                    SELECT table_name, column_name, data_type
+                    FROM information_schema.columns
+                    WHERE table_schema = 'gold'
+                ) c
+                    ON c.table_name = e.table_name
+                   AND c.column_name = e.column_name
+                WHERE c.data_type IS DISTINCT FROM e.data_type
                 """,
                 "0",
                 lambda val: int(val) == 0,
