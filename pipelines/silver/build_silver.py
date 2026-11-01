@@ -25,11 +25,13 @@ import os
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DB_URL = os.getenv(
     "DATABASE_URL",
     os.getenv("LOCAL_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"),
@@ -104,8 +106,12 @@ def _parse_payload(raw_payload: Any) -> dict[str, Any]:
 
 
 def _parse_utc_timestamp(value: Any) -> datetime | None:
-    """Parse an ISO-8601 timestamp with any timezone offset and normalize to UTC."""
-    if value is None or value == "":
+    """Parse an ISO-8601 timestamp with any timezone offset and normalize to UTC.
+
+    Strictly rejects booleans, nested dicts/lists, and malformed timestamp strings
+    by returning ``None`` so invalid records are routed to ``silver.rejected_records``.
+    """
+    if value is None or value == "" or isinstance(value, (bool, dict, list)):
         return None
     if isinstance(value, datetime):
         if value.tzinfo is None:
@@ -117,15 +123,21 @@ def _parse_utc_timestamp(value: Any) -> datetime | None:
         return None
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
-    dt = datetime.fromisoformat(text)
+    try:
+        dt = datetime.fromisoformat(text)
+    except (ValueError, TypeError):
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
 
 def _parse_date(value: Any) -> date | None:
-    """Parse an ISO-8601 date or timestamp string into a ``date`` object."""
-    if value is None or value == "":
+    """Parse an ISO-8601 date or timestamp string into a ``date`` object.
+
+    Strictly rejects booleans, nested dicts/lists, and malformed date strings.
+    """
+    if value is None or value == "" or isinstance(value, (bool, dict, list)):
         return None
     if isinstance(value, datetime):
         return value.date()
@@ -137,27 +149,48 @@ def _parse_date(value: Any) -> date | None:
     if "T" in text:
         ts = _parse_utc_timestamp(text)
         return ts.date() if ts else None
-    return date.fromisoformat(text[:10])
+    try:
+        return date.fromisoformat(text[:10])
+    except (ValueError, TypeError):
+        return None
 
 
 def _parse_decimal(value: Any, default: Decimal | None = None) -> Decimal | None:
-    """Parse a numeric value into a Decimal."""
+    """Parse a finite numeric value into a ``Decimal`` (rejecting bool, NaN, and Inf)."""
     if value is None or value == "":
         return default
+    if isinstance(value, (bool, dict, list)):
+        return None
     try:
-        return Decimal(str(value).strip())
-    except (InvalidOperation, ValueError):
+        d = Decimal(str(value).strip())
+        if not d.is_finite():
+            return None
+        return d
+    except (InvalidOperation, ValueError, TypeError):
         return None
 
 
 def _parse_int(value: Any) -> int | None:
-    """Parse an integer value safely."""
+    """Parse an exact integer value safely (rejecting bool, NaN/Inf, and non-integral decimals)."""
     if value is None or value == "":
         return None
-    try:
-        return int(Decimal(str(value).strip()))
-    except (InvalidOperation, ValueError):
+    if isinstance(value, (bool, dict, list)):
         return None
+    try:
+        d = Decimal(str(value).strip())
+        if not d.is_finite() or d != int(d):
+            return None
+        return int(d)
+    except (InvalidOperation, ValueError, TypeError, OverflowError):
+        return None
+
+
+def _ensure_silver_and_ops_schemas(cur) -> None:
+    """Ensure ``ops``, ``bronze``, and ``silver`` schemas exist when running from an empty database."""
+    for schema_name in ("ops.sql", "bronze.sql", "silver.sql"):
+        sql_path = PROJECT_ROOT / "database" / "schemas" / schema_name
+        if sql_path.exists():
+            cur.execute(sql_path.read_text(encoding="utf-8"))
 
 
 def _clean_source_row_id(source_row_id: str | None) -> str:
@@ -280,23 +313,32 @@ class _RejectionCollector:
         cur.execute("DELETE FROM silver.rejected_records")
 
         if "rejection_reason" in cols and "source_table" in cols:
-            for rec in self.records:
+            row_tpl = "(%s, %s, %s, %s, CAST(%s AS JSONB), %s)"
+            chunk_size = 500
+            for start in range(0, len(self.records), chunk_size):
+                chunk = self.records[start : start + chunk_size]
+                placeholders = ", ".join([row_tpl] * len(chunk))
+                flat_params: list[Any] = []
+                for rec in chunk:
+                    flat_params.extend(
+                        [
+                            rec["source_table"],
+                            rec["source_row_id"],
+                            rec["bronze_id"],
+                            rec["rejection_reason"],
+                            rec["raw_payload"],
+                            rec["pipeline_run_id"],
+                        ]
+                    )
                 cur.execute(
-                    """
+                    f"""
                     INSERT INTO silver.rejected_records (
                         source_table, source_row_id, bronze_id,
                         rejection_reason, raw_payload, pipeline_run_id
                     )
-                    VALUES (%s, %s, %s, %s, CAST(%s AS JSONB), %s)
+                    VALUES {placeholders}
                     """,
-                    (
-                        rec["source_table"],
-                        rec["source_row_id"],
-                        rec["bronze_id"],
-                        rec["rejection_reason"],
-                        rec["raw_payload"],
-                        rec["pipeline_run_id"],
-                    ),
+                    flat_params,
                 )
         else:
             for rec in self.records:
@@ -318,7 +360,7 @@ class _RejectionCollector:
 
 
 def _exec_batch(cur, driver: str, sql_values: str, sql_row: str, rows: list[tuple[Any, ...]], template: str | None = None) -> None:
-    """Execute batch upserts using execute_values on psycopg2 or executemany on pg8000."""
+    """Execute batch upserts using execute_values on psycopg2 or multi-row chunked VALUES on pg8000."""
     if not rows:
         return
     if driver == "psycopg2":
@@ -326,7 +368,14 @@ def _exec_batch(cur, driver: str, sql_values: str, sql_row: str, rows: list[tupl
 
         execute_values(cur, sql_values, rows, template=template, page_size=2000)
     else:
-        cur.executemany(sql_row, rows)
+        ncols = len(rows[0])
+        row_tpl = template.replace("::order_status", "::order_status") if template else "(" + ", ".join(["%s"] * ncols) + ")"
+        chunk_size = 500
+        for start in range(0, len(rows), chunk_size):
+            chunk = rows[start : start + chunk_size]
+            placeholders = ", ".join([row_tpl] * len(chunk))
+            flat_params = [val for row in chunk for val in row]
+            cur.execute(sql_values.replace("VALUES %s", f"VALUES {placeholders}"), flat_params)
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +437,8 @@ def run_silver(pipeline_run_id: str | None = None) -> str:
     loaded_stats: dict[str, int] = {}
 
     try:
+        _ensure_silver_and_ops_schemas(cur)
+
         # Ensure bronze.raw_ingestion exists and is synced if Silver FKs reference it
         cur.execute(
             """
@@ -1190,7 +1241,7 @@ def run_silver(pipeline_run_id: str | None = None) -> str:
                 sales_channel, store_id, status, shipping_revenue,
                 source_row_id, bronze_id, pipeline_run_id
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, CAST(%s AS order_status), %s, %s, %s, %s)
             ON CONFLICT (order_id) DO UPDATE SET
                 customer_id = EXCLUDED.customer_id,
                 ordered_at_utc = EXCLUDED.ordered_at_utc,
@@ -1204,6 +1255,7 @@ def run_silver(pipeline_run_id: str | None = None) -> str:
                 pipeline_run_id = EXCLUDED.pipeline_run_id
             """,
             list(orders_by_id.values()),
+            template="(%s, %s, %s, %s, %s, %s, %s::order_status, %s, %s, %s, %s)",
         )
         valid_order_ids = set(orders_by_id.keys())
         loaded_stats["silver.orders"] = len(orders_by_id)
@@ -2134,6 +2186,75 @@ def run_quality_gate(pipeline_run_id: str | None = None) -> bool:
                         (SELECT COUNT(*) FROM silver.rejected_records WHERE source_table = 'silver.orders' AND pipeline_run_id = (SELECT pipeline_run_id FROM silver.orders LIMIT 1))
                     )
                 )
+                """,
+                "0",
+                lambda val: int(val) == 0,
+            ),
+            (
+                "silver_all_tables_bronze_reconciliation",
+                "reconciliation",
+                "silver.rejected_records",
+                """
+                SELECT ABS(
+                    (SELECT COALESCE(SUM(records_loaded), 0) FROM ops.layer_load_stats WHERE layer = 'bronze' AND pipeline_run_id = (SELECT pipeline_run_id FROM silver.orders LIMIT 1))
+                    - (
+                        SELECT COALESCE(SUM(records_loaded + records_rejected), 0)
+                        FROM ops.layer_load_stats
+                        WHERE layer = 'silver' AND pipeline_run_id = (SELECT pipeline_run_id FROM silver.orders LIMIT 1)
+                    )
+                )
+                """,
+                "0",
+                lambda val: int(val) == 0,
+            ),
+            (
+                "silver_column_data_types_valid",
+                "business_rule",
+                "silver.orders",
+                """
+                WITH expected_types(table_name, column_name, expected_type) AS (
+                    VALUES
+                        ('customers', 'created_at_utc', 'timestamp with time zone'),
+                        ('customer_profiles', 'valid_from_utc', 'timestamp with time zone'),
+                        ('customer_profiles', 'valid_to_utc', 'timestamp with time zone'),
+                        ('customer_addresses', 'valid_from_utc', 'timestamp with time zone'),
+                        ('customer_addresses', 'valid_to_utc', 'timestamp with time zone'),
+                        ('products', 'unit_price', 'numeric'),
+                        ('product_categories', 'valid_from_utc', 'timestamp with time zone'),
+                        ('product_categories', 'valid_to_utc', 'timestamp with time zone'),
+                        ('promotions', 'discount_rate', 'numeric'),
+                        ('promotions', 'start_date', 'date'),
+                        ('promotions', 'end_date', 'date'),
+                        ('orders', 'ordered_at_utc', 'timestamp with time zone'),
+                        ('orders', 'updated_at_utc', 'timestamp with time zone'),
+                        ('orders', 'shipping_revenue', 'numeric'),
+                        ('orders', 'status', 'USER-DEFINED'),
+                        ('order_items', 'quantity', 'integer'),
+                        ('order_items', 'unit_price', 'numeric'),
+                        ('order_items', 'item_discount_amount', 'numeric'),
+                        ('order_promotions', 'discount_amount', 'numeric'),
+                        ('payment_events', 'occurred_at_utc', 'timestamp with time zone'),
+                        ('payment_events', 'amount', 'numeric'),
+                        ('refund_events', 'occurred_at_utc', 'timestamp with time zone'),
+                        ('refund_events', 'amount', 'numeric'),
+                        ('return_events', 'occurred_at_utc', 'timestamp with time zone'),
+                        ('support_events', 'occurred_at_utc', 'timestamp with time zone'),
+                        ('web_events', 'occurred_at_utc', 'timestamp with time zone'),
+                        ('inventory_snapshots', 'snapshot_date', 'date'),
+                        ('inventory_snapshots', 'available_quantity', 'integer'),
+                        ('inventory_snapshots', 'reserved_quantity', 'integer'),
+                        ('inventory_snapshots', 'unit_cost', 'numeric'),
+                        ('campaign_spend', 'spend_date', 'date'),
+                        ('campaign_spend', 'spend_amount', 'numeric'),
+                        ('rejected_records', 'raw_payload', 'jsonb')
+                )
+                SELECT COUNT(*)
+                FROM expected_types e
+                LEFT JOIN information_schema.columns c
+                    ON c.table_schema = 'silver'
+                   AND c.table_name = e.table_name
+                   AND c.column_name = e.column_name
+                WHERE c.data_type IS DISTINCT FROM e.expected_type
                 """,
                 "0",
                 lambda val: int(val) == 0,
